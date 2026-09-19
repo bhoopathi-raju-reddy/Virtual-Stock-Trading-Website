@@ -447,16 +447,6 @@ function App() {
     [holdingsWithDetails],
   )
 
-  const portfolioAllocation = useMemo(() => {
-    const total = holdingsWithDetails.reduce((sum, item) => sum + item.currentValue, 0) || 1
-    return holdingsWithDetails.map((item) => ({
-      symbol: item.symbol,
-      value: item.currentValue,
-      percent: (item.currentValue / total) * 100,
-      color: getColorBySymbol(item.symbol),
-    }))
-  }, [holdingsWithDetails])
-
   const portfolioRows = useMemo(() => {
     const rows = portfolioTab === 'all' ? holdingsWithDetails : holdingsWithDetails.filter((item) => item.typeName === portfolioTab)
     return rows
