@@ -1,4 +1,4 @@
-﻿import { useMemo, useState } from 'react'
+﻿import { useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 const stockData = [
@@ -267,8 +267,15 @@ const cryptoData = [
   },
 ]
 
-const allAssets = [...stockData, ...cryptoData]
-const allAssetMap = Object.fromEntries(allAssets.map((asset) => [asset.symbol, asset]))
+const baseAllAssets = [...stockData, ...cryptoData]
+const baseAssetMap = Object.fromEntries(baseAllAssets.map((asset) => [asset.symbol, asset]))
+
+const stockSymbols = ['AAPL', 'TSLA', 'NVDA', 'AMZN', 'MSFT', 'GOOGL', 'META']
+const cryptoSymbolMap = {
+  BTC: 'bitcoin',
+  ETH: 'ethereum',
+  SOL: 'solana',
+}
 
 const initialHoldings = [
   { symbol: 'AAPL', type: 'stock', quantity: 18, avgPrice: 198.4 },
@@ -398,8 +405,259 @@ function App() {
     walletNickname: 'My MetaMask Wallet',
   })
   const [authMessage, setAuthMessage] = useState('')
+  const [marketData, setMarketData] = useState(() => baseAllAssets.map((asset) => ({ ...asset })))
+  const [marketFeedStatus, setMarketFeedStatus] = useState({ crypto: 'connecting', stocks: 'connecting' })
+
+  const allAssets = marketData
+  const allAssetMap = useMemo(
+    () => Object.fromEntries(allAssets.map((asset) => [asset.symbol, asset])),
+    [allAssets],
+  )
 
   const selectedAsset = allAssetMap[selectedSymbol] || allAssets[0]
+
+  useEffect(() => {
+    const updateAssetPrices = (updates) => {
+      setMarketData((prev) =>
+        prev.map((asset) => {
+          const next = updates[asset.symbol]
+          if (!next) return asset
+          return {
+            ...asset,
+            ...(typeof next.price === 'number' ? { price: next.price } : {}),
+            ...(typeof next.changePercent === 'number' ? { changePercent: next.changePercent } : {}),
+          }
+        }),
+      )
+    }
+
+    let cryptoSocket = null
+    let cryptoReconnectTimer = null
+    let cryptoRefreshInterval = null
+    let stockSocket = null
+    let stockReconnectTimer = null
+    let stockHeartbeatTimer = null
+    let cryptoHeartbeatTimer = null
+
+    const setStatus = (feed, status) => {
+      setMarketFeedStatus((prev) => ({ ...prev, [feed]: status }))
+    }
+
+    const fetchCoinGecko = async () => {
+      try {
+        const response = await fetch(
+          'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana&vs_currencies=usd&include_24hr_change=true',
+          { headers: { accept: 'application/json' } },
+        )
+
+        if (!response.ok) {
+          throw new Error(`CoinGecko request failed with ${response.status}`)
+        }
+
+        const payload = await response.json()
+        const updates = {
+          BTC: {
+            price: Number(payload.bitcoin?.usd ?? 0),
+            changePercent: Number(payload.bitcoin?.usd_24h_change ?? 0),
+          },
+          ETH: {
+            price: Number(payload.ethereum?.usd ?? 0),
+            changePercent: Number(payload.ethereum?.usd_24h_change ?? 0),
+          },
+          SOL: {
+            price: Number(payload.solana?.usd ?? 0),
+            changePercent: Number(payload.solana?.usd_24h_change ?? 0),
+          },
+        }
+
+        updateAssetPrices(updates)
+        setStatus('crypto', 'delayed')
+      } catch (error) {
+        setStatus('crypto', 'reconnecting')
+      }
+    }
+
+    const connectBinance = () => {
+      if (cryptoSocket) {
+        cryptoSocket.close()
+      }
+
+      try {
+        const socketUrl = 'wss://stream.binance.com:9443/stream?streams=btcusdt@ticker/ethusdt@ticker/solusdt@ticker'
+        cryptoSocket = new WebSocket(socketUrl)
+
+        let lastMessageAt = Date.now()
+        if (cryptoHeartbeatTimer) clearInterval(cryptoHeartbeatTimer)
+        cryptoHeartbeatTimer = setInterval(() => {
+          if (Date.now() - lastMessageAt > 30000) {
+            setStatus('crypto', 'reconnecting')
+            if (cryptoSocket && cryptoSocket.readyState === WebSocket.OPEN) {
+              cryptoSocket.close()
+            }
+          }
+        }, 10000)
+
+        cryptoSocket.onopen = () => {
+          setStatus('crypto', 'live')
+          if (cryptoRefreshInterval) {
+            clearInterval(cryptoRefreshInterval)
+            cryptoRefreshInterval = null
+          }
+        }
+
+        cryptoSocket.onmessage = (event) => {
+          const payload = JSON.parse(event.data)
+          const { data } = payload || {}
+          const symbol = data?.s ? data.s.replace('USDT', '') : null
+          const price = Number(data?.c)
+          const changePercent = Number(data?.P)
+
+          if (!symbol || !['BTC', 'ETH', 'SOL'].includes(symbol) || Number.isNaN(price)) {
+            return
+          }
+
+          lastMessageAt = Date.now()
+          updateAssetPrices({
+            [symbol]: {
+              price,
+              changePercent: Number.isFinite(changePercent) ? changePercent : 0,
+            },
+          })
+          setStatus('crypto', 'live')
+        }
+
+        cryptoSocket.onerror = () => {
+          setStatus('crypto', 'reconnecting')
+        }
+
+        cryptoSocket.onclose = () => {
+          if (cryptoRefreshInterval) {
+            clearInterval(cryptoRefreshInterval)
+          }
+
+          if (cryptoReconnectTimer) {
+            clearTimeout(cryptoReconnectTimer)
+          }
+
+          setStatus('crypto', 'reconnecting')
+          fetchCoinGecko()
+          cryptoRefreshInterval = setInterval(() => {
+            fetchCoinGecko()
+          }, 25000)
+
+          cryptoReconnectTimer = setTimeout(() => {
+            connectBinance()
+          }, 5000)
+        }
+      } catch (error) {
+        setStatus('crypto', 'reconnecting')
+        fetchCoinGecko()
+      }
+    }
+
+    const connectFinnhub = () => {
+      const apiKey = import.meta.env.VITE_FINNHUB_API_KEY
+
+      if (!apiKey) {
+        setStatus('stocks', 'delayed')
+        return
+      }
+
+      if (stockSocket) {
+        stockSocket.close()
+      }
+
+      try {
+        stockSocket = new WebSocket(`wss://ws.finnhub.io?token=${apiKey}`)
+        let lastMessageAt = Date.now()
+
+        if (stockHeartbeatTimer) clearInterval(stockHeartbeatTimer)
+        stockHeartbeatTimer = setInterval(() => {
+          if (Date.now() - lastMessageAt > 30000) {
+            setStatus('stocks', 'reconnecting')
+            if (stockSocket && stockSocket.readyState === WebSocket.OPEN) {
+              stockSocket.close()
+            }
+          }
+        }, 10000)
+
+        stockSocket.onopen = () => {
+          setStatus('stocks', 'live')
+          stockSymbols.forEach((symbol) => {
+            stockSocket.send(JSON.stringify({ type: 'subscribe', symbol }))
+          })
+        }
+
+        stockSocket.onmessage = (event) => {
+          const payload = JSON.parse(event.data)
+          const quoteData = Array.isArray(payload?.data) ? payload.data : []
+
+          quoteData.forEach((quote) => {
+            const symbol = quote?.s
+            const price = Number(quote?.p ?? quote?.c ?? NaN)
+            const changePercent = Number(quote?.dp ?? 0)
+
+            if (!symbol || !stockSymbols.includes(symbol) || !Number.isFinite(price)) {
+              return
+            }
+
+            lastMessageAt = Date.now()
+            updateAssetPrices({
+              [symbol]: {
+                price,
+                changePercent: Number.isFinite(changePercent) ? changePercent : 0,
+              },
+            })
+            setStatus('stocks', 'live')
+          })
+        }
+
+        stockSocket.onerror = () => {
+          setStatus('stocks', 'reconnecting')
+        }
+
+        stockSocket.onclose = () => {
+          if (stockReconnectTimer) {
+            clearTimeout(stockReconnectTimer)
+          }
+
+          setStatus('stocks', 'reconnecting')
+          stockReconnectTimer = setTimeout(() => {
+            connectFinnhub()
+          }, 4000)
+        }
+      } catch (error) {
+        setStatus('stocks', 'delayed')
+      }
+    }
+
+    connectBinance()
+    connectFinnhub()
+
+    return () => {
+      if (cryptoSocket) cryptoSocket.close()
+      if (stockSocket) stockSocket.close()
+      if (cryptoRefreshInterval) clearInterval(cryptoRefreshInterval)
+      if (cryptoReconnectTimer) clearTimeout(cryptoReconnectTimer)
+      if (stockReconnectTimer) clearTimeout(stockReconnectTimer)
+      if (cryptoHeartbeatTimer) clearInterval(cryptoHeartbeatTimer)
+      if (stockHeartbeatTimer) clearInterval(stockHeartbeatTimer)
+    }
+  }, [])
+
+  const feedIndicator =
+    marketFeedStatus.crypto === 'reconnecting' || marketFeedStatus.stocks === 'reconnecting'
+      ? 'Reconnecting'
+      : marketFeedStatus.crypto === 'delayed' || marketFeedStatus.stocks === 'delayed'
+        ? 'Delayed data'
+        : 'Live data'
+
+  const feedIndicatorClass =
+    marketFeedStatus.crypto === 'reconnecting' || marketFeedStatus.stocks === 'reconnecting'
+      ? 'status-warning'
+      : marketFeedStatus.crypto === 'delayed' || marketFeedStatus.stocks === 'delayed'
+        ? 'status-delayed'
+        : 'status-live'
 
   const filteredAssets = useMemo(() => {
     const term = searchTerm.trim().toLowerCase()
@@ -880,6 +1138,10 @@ function App() {
           </div>
 
           <div className="topbar-actions">
+            <div className={`feed-status ${feedIndicatorClass}`}>
+              <span className="feed-dot" />
+              {feedIndicator}
+            </div>
             <button type="button" className="ghost-btn" onClick={() => setActivePage('markets')}>
               Explore Markets
             </button>
